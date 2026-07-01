@@ -1,0 +1,29 @@
+# 密钥与凭证（绝不进 git）
+.env
+.env
+.env.*
+!.env.example
+
+# 数据库与数据
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+
+# 日志
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+.claude/settings.local.json

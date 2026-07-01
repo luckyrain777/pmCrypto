@@ -1,0 +1,16 @@
+# Polymarket 接入
+py-clob-client>=0.17.0
+
+# 数据分析
+pandas>=2.0
+numpy>=1.24
+
+# 网页面板
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# 配置
+python-dotenv>=1.0
+
+# 测试
+pytest>=8.0
