@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pmCrypto · 这个项目到底在做什么</title>
+<style>
+  :root { --bg:#0f1115; --card:#161a22; --line:#262b36; --fg:#e6e6e6; --mut:#8a94a6;
+          --accent:#4ade80; --danger:#f87171; --warn:#fbbf24; --info:#7dd3fc; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,"Segoe UI",sans-serif; margin:0; background:var(--bg);
+         color:var(--fg); line-height:1.7; }
+  a { color:var(--info); }
+  header { padding:22px 20px; background:var(--card); border-bottom:1px solid var(--line); }
+  header h1 { font-size:22px; margin:0; }
+  header .sub { color:var(--mut); font-size:13px; margin-top:6px; }
+  header .back { float:right; font-size:13px; }
+  main { max-width:920px; margin:0 auto; padding:24px 20px 80px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px;
+            padding:22px 24px; margin-bottom:22px; }
+  h2 { font-size:18px; margin:0 0 4px; color:#dbe4f0; }
+  h2 .n { color:var(--accent); font-weight:700; margin-right:8px; }
+  .lead { color:var(--mut); font-size:13px; margin:0 0 16px; }
+  h3 { font-size:15px; margin:20px 0 6px; color:#c3cddb; }
+  p { margin:10px 0; }
+  .big-answer { font-size:15px; }
+  .tag { display:inline-block; font-size:11px; font-weight:700; padding:2px 9px; border-radius:999px;
+         vertical-align:middle; }
+  .tag-yes { background:#123524; color:var(--accent); }
+  .tag-no { background:#3a1418; color:var(--danger); }
+  .tag-part { background:#3a2f14; color:var(--warn); }
+  .qa { border-left:3px solid var(--line); padding:2px 0 2px 16px; margin:18px 0; }
+  .qa .q { font-weight:700; color:#e8eef6; }
+  .qa .a { color:#c9d2de; margin-top:4px; }
+  .kv { display:grid; grid-template-columns:150px 1fr; gap:6px 14px; font-size:13.5px; margin:12px 0; }
+  .kv .k { color:var(--mut); }
+  .callout { border-radius:8px; padding:12px 16px; margin:14px 0; font-size:13.5px; }
+  .callout.warn { background:rgba(251,191,36,.08); border:1px solid #3a2f14; }
+  .callout.danger { background:rgba(248,113,113,.07); border:1px solid #3a1418; }
+  .callout.ok { background:rgba(74,222,128,.07); border:1px solid #123524; }
+  .callout b { color:#fff; }
+  code, .mono { font-family:"SF Mono",Consolas,monospace; background:#0f1115; border:1px solid var(--line);
+         border-radius:5px; padding:1px 6px; font-size:12.5px; color:#cbd5e1; }
+  .formula { background:#0f1115; border:1px solid var(--line); border-radius:8px; padding:14px 16px;
+             font-family:"SF Mono",Consolas,monospace; font-size:13px; color:#dbe4f0; margin:12px 0; overflow-x:auto; }
+  ul { margin:10px 0; padding-left:22px; } li { margin:5px 0; }
+  .step { display:flex; gap:14px; margin:14px 0; align-items:flex-start; }
+  .step .num { flex:none; width:26px; height:26px; border-radius:50%; background:#1e242e;
+               border:1px solid var(--line); display:flex; align-items:center; justify-content:center;
+               font-size:13px; font-weight:700; color:var(--accent); }
+  .gate { display:flex; gap:10px; align-items:baseline; padding:7px 0; border-bottom:1px solid #1e232c; font-size:13.5px; }
+  .gate:last-child { border-bottom:none; }
+  .gate .g-n { color:var(--danger); font-weight:700; flex:none; width:22px; }
+  .muted { color:var(--mut); font-size:12.5px; }
+  .toc { columns:2; font-size:13px; } .toc a { display:block; padding:3px 0; text-decoration:none; }
+  @media(max-width:640px){ .kv{grid-template-columns:110px 1fr;} .toc{columns:1;} }
+</style>
+</head>
+<body>
+<header>
+  <a class="back" href="/">← 返回控制台</a>
+  <h1>pmCrypto · 这个项目到底在做什么</h1>
+  <div class="sub">一份把代码里的真实机制讲清楚的全景说明 —— 不美化、不含糊、每条都有依据</div>
+</header>
+
+<main>
+
+  <section>
+    <h2><span class="n">§</span>一句话概括</h2>
+    <p class="big-answer">
+      这是一个盯着 <b>Polymarket（预测市场）</b> 的自动交易系统。它做两件事：
+      ① 找市场里<b>机械的算术错价</b>（无风险套利）；
+      ② 对<b>加密货币价格类市场</b>，用数学模型算出"真实概率"，找出被市场<b>定错价</b>的机会。
+      默认<b>只提示、不下单</b>，要真金白银交易需手动逐层解锁。
+    </p>
+    <div class="toc">
+      <a href="#q">▸ 你最关心的几个问题（先看这个）</a>
+      <a href="#what">▸ 到底交易哪些市场</a>
+      <a href="#crypto">▸ 加密预测的原理（核心）</a>
+      <a href="#science">▸ 它科学吗？诚实的局限</a>
+      <a href="#size">▸ 怎么决定下多少钱</a>
+      <a href="#safety">▸ 防止乱下单/亏损的闸门</a>
+      <a href="#money">▸ 到底怎么才能赚钱</a>
+    </div>
+  </section>
+
+  <section id="q">
+    <h2><span class="n">Q</span>你最关心的几个问题</h2>
+    <p class="lead">先直接回答你的疑问，纠正几个常见误解。</p>
+
+    <div class="qa">
+      <div class="q">是"5 分钟 / 15 分钟 BTC 涨跌预测"吗？ <span class="tag tag-no">不是</span></div>
+      <div class="a">
+        这是最大的误解。系统预测的<b>不是</b>"未来 5 分钟 BTC 涨还是跌"。它处理的是这种形式的市场：
+        <br><b>"到某个到期日，BTC 是否高于/低于某个价格？"</b>——例如
+        <span class="mono">"Will Bitcoin be above $60,000 on 2025-12-31?"</span>。
+        它解析出三样东西：<b>币种</b>（BTC）、<b>目标价</b>（$60,000）、<b>方向</b>（above/below），
+        <b>完全没有"5分钟/15分钟"这种时间窗口维度</b>。到期时间从几小时到几个月不等，题目是固定的。
+      </div>
+    </div>
+
+    <div class="qa">
+      <div class="q">多久预测/扫描一次？</div>
+      <div class="a">
+        每 <b>45 秒</b>扫描一轮（可调，<code>poll_interval_sec</code>）。但请注意区分两件事：
+        <b>"多久扫一眼" = 45 秒</b>；<b>"市场多久出结果" = 由每个市场自己的到期日决定</b>（各不相同）。
+        你扫得再勤，一个"本周五结算"的市场，一周也只产生 1 个最终结果。
+      </div>
+    </div>
+
+    <div class="qa">
+      <div class="q">支持哪些币？</div>
+      <div class="a">加密定价模型支持 <b>BTC、ETH、SOL、DOGE</b> 四种。其它币种的市场，模型不参与。</div>
+    </div>
+
+    <div class="qa">
+      <div class="q">能预测世界杯 / 体育 / 政治这些热门市场吗？ <span class="tag tag-part">部分/需分清</span></div>
+      <div class="a">
+        <b>加密模型完全不碰它们</b>——遇到非加密市场，解析直接返回"无法识别"，跳过，绝不猜。
+        所以系统<b>不会用价格模型给世界杯"预测下注"</b>。<br>
+        唯一例外：<b>无风险套利</b>策略与主题无关，任何市场（含世界杯）只要出现"买 Yes + 买 No 的价格加起来 &lt; 1"
+        这种机械错价，它都会提示。但那是<b>捡算术便宜，不是预测比赛结果</b>。
+      </div>
+    </div>
+
+    <div class="qa">
+      <div class="q">它现在会自动花我的钱吗？ <span class="tag tag-no">默认不会</span></div>
+      <div class="a">
+        默认是<b>"只提示、不下单"</b>模式（干跑）。要真金白银交易，必须逐层通过：edge 验证达标 + 钱包凭证齐全 +
+        手动点"启用真钱"。任一不满足就绝不花钱。详见下方<a href="#safety">安全闸门</a>。
+      </div>
+    </div>
+  </section>
+
+  <section id="what">
+    <h2><span class="n">1</span>到底交易哪些市场，用几种策略</h2>
+    <p class="lead">平台是 Polymarket。市场以二元 Yes/No 为主，也有多结果市场。系统有三种信号来源：</p>
+
+    <h3>策略 A · 无风险套利（与主题无关）<span class="tag tag-yes">最稳</span></h3>
+    <p>不预测任何东西，只找<b>机械的算术错价</b>：</p>
+    <ul>
+      <li><b>Yes/No 互补偏差</b>：如果"买 Yes 的价 + 买 No 的价 &lt; 1"，同时买两边，到期必有一边赢，锁定无风险差价。</li>
+      <li><b>多结果概率和偏差</b>：多个互斥结果的买入价加起来 &lt; 1，全买锁利。</li>
+    </ul>
+    <p class="muted">这类机会稀少但确定性高，对世界杯/政治/加密任何市场都成立。（注：多腿套利需原子成交，当前版本只提示、不自动执行。）</p>
+
+    <h3>策略 B · 方向性统计信号</h3>
+    <p>综合<b>动量</b>（价格趋势）、<b>盘口失衡</b>（买卖盘厚薄）、<b>量价背离</b>三个统计信号，估一个概率，和市场报价比找偏差。
+    <span class="muted">这是纯统计、无基本面模型，对陌生市场容易误导——所以必须经验证才允许真下单。</span></p>
+
+    <h3>策略 C · 加密价格误定价（最有效，下一节详解）<span class="tag tag-yes">核心</span></h3>
+    <p>对 BTC/ETH/SOL/DOGE 的"是否突破某价"市场，用数学模型算真实概率找错价。这是系统的主打。</p>
+  </section>
+
+  <section id="crypto">
+    <h2><span class="n">2</span>加密预测的原理（核心机制）</h2>
+    <p class="lead">这是系统最有含金量的部分，值得看懂。它其实是一套"期权定价"的思路。</p>
+
+    <h3>要回答的问题</h3>
+    <p>市场问："到期日 T，BTC 会不会高于 $K？"并给了一个报价 <code>q</code>（比如 0.35，即市场认为 35% 概率）。
+    系统要独立算出<b>自己认为的真实概率 p</b>，如果 <code>p</code> 明显 &gt; <code>q</code>，说明市场把它<b>定便宜了</b> → 值得买。</p>
+
+    <h3>怎么算这个真实概率 p</h3>
+    <p>用<b>对数正态模型</b>（几何布朗运动，Black-Scholes 同款假设）——金融界给期权定价的标准工具：</p>
+    <div class="formula">
+      P(到期时 S<sub>T</sub> &gt; K) = Φ(d₂)<br>
+      d₂ = [ ln(S / K) − ½·σ²·T ] / (σ·√T)<br><br>
+      S = 当前现价 &nbsp; K = 目标价 &nbsp; σ = 年化波动率 &nbsp; T = 距到期时间(年) &nbsp; Φ = 标准正态累积分布
+    </div>
+    <p>直觉解释：现价离目标价越近、时间越长、波动越大 → 突破的概率越高。这三个因素被数学严格地组合起来。</p>
+
+    <h3>三个输入从哪来</h3>
+    <div class="kv">
+      <span class="k">现价 S</span><span>实时从 Coinbase / Binance 拉取</span>
+      <span class="k">到期时间 T</span><span>从市场自带的到期日算出</span>
+      <span class="k">波动率 σ</span><span><b>用近 30 天真实 K 线算出的"已实现波动率"</b>（对数收益标准差×√365），拉不到才降级到常数</span>
+    </div>
+    <div class="callout ok">
+      <b>关于波动率 σ 的重要改进：</b>早期版本 σ 是写死的常数（BTC 55%）。实测发现 BTC 近期真实波动率约
+      <b>38%</b>——常数高估了 44%！这会系统性地高估"看涨概率"、制造假机会。现已改为<b>用真实历史 K 线校准</b>，
+      从根上消除了这个偏差。
+    </div>
+
+    <h3>置信度</h3>
+    <p>模型对自己的信心随到期时间变化：<b>越临近到期越可靠</b>（&gt;30天→0.3 低信心；≤1天→0.95 高信心）。
+    因为越临近到期，波动率假设的影响越小，极端情况下退化为"现价是否已经过线"，这时几乎不会错。</p>
+  </section>
+
+  <section id="science">
+    <h2><span class="n">3</span>它科学吗？—— 诚实的局限</h2>
+    <p class="lead">模型是严谨的，但有真实的边界。这些是代码作者自己在注释里承认的，不是我加的。</p>
+
+    <div class="callout warn">
+      <b>① 波动率是"已实现"不是"隐含"。</b>我们用"过去 30 天实际波动"，而市场定价参考的是"未来预期波动"（隐含波动率）。
+      两者通常接近，但重大事件前会背离。这比写死常数好得多，但仍非完美。
+    </div>
+    <div class="callout warn">
+      <b>② 滑点是"估"的。</b>真实下单时盘口在变、还有别的机器人抢单。系统刻意把滑点估得偏保守（放大 1.5 倍），
+      宁可少算机会也不高估收益——因为高估收益 = 拿真钱去亏。
+    </div>
+    <div class="callout warn">
+      <b>③ edge 是估计，必须回测验证。</b>模型算出的"真实概率"终究是估计。所以系统要求：只有用<b>真实已结算结果</b>
+      验证过、且统计上显著为正（95% 置信区间下界 &gt; 0、样本 ≥ 30 个已结算市场），才允许上真钱。
+      样本不足时会诚实地判"证据不足，别上真钱"。
+    </div>
+    <p class="big-answer">
+      一句话：<b>方法是科学的（标准期权定价 + 真实波动率 + 统计显著性检验），但它给的是"概率优势"不是"确定性"。</b>
+      能不能赚钱，最终要靠真实结算数据来验证，而不是模型自己说了算。
+    </p>
+  </section>
+
+  <section id="size">
+    <h2><span class="n">4</span>怎么决定下多少钱</h2>
+    <p class="lead">用 Kelly 公式做"复利最优下注"，但层层设限，绝不梭哈。</p>
+    <div class="formula">Kelly 最优比例 f* = edge / (1 − q) = (p − q) / (1 − q)</div>
+    <p>然后经过<b>三重削减</b>取最小值，确保永不破产：</p>
+    <ul>
+      <li><b>自适应 Kelly 分数</b>：只用 ¼~½ Kelly（信心越高越接近 ½），比满 Kelly 保守得多。</li>
+      <li><b>单笔硬封顶</b>：最多占余额 20%。</li>
+      <li><b>总仓位上限 + 流动性限制</b>：所有在场仓位合计最多 50% 余额，且不超过市场能吃下的深度。</li>
+    </ul>
+    <div class="callout ok">
+      <b>复利核心：</b>每次下单前用<b>真实链上余额</b>刷新基数。赢了余额变大 → 下一注自动变大；输了自动变小。
+      这是"自动复利"，但前提是"永不破产"——所以上面的削减和下面的熔断一个都不能少。
+    </div>
+  </section>
+
+  <section id="safety">
+    <h2><span class="n">5</span>防止乱下单 / 亏损的闸门</h2>
+    <p class="lead">从"想下单"到"真花钱"，要连过 6 道门；运行中还有 4 道自动熔断。</p>
+
+    <h3>下单前的 6 道门（任一不过就拒绝）</h3>
+    <div class="gate"><span class="g-n">1</span><span><b>全局急停门</b> —— 系统处于急停态，一律不下单。</span></div>
+    <div class="gate"><span class="g-n">2</span><span><b>干跑门</b>（默认开）—— 走完全部逻辑但只打印、不发单。默认就是这个，不显式关掉不会花钱。</span></div>
+    <div class="gate"><span class="g-n">3</span><span><b>edge 验证门</b> —— 未经真实结算验证（<code>edge_verified</code>）不许真下单。</span></div>
+    <div class="gate"><span class="g-n">4</span><span><b>凭证门</b> —— .env 里钱包私钥 + API 凭证不齐，拒绝。</span></div>
+    <div class="gate"><span class="g-n">5</span><span><b>机会类型门</b> —— 目前只自动执行单腿方向性单；多腿套利需原子成交，只提示。</span></div>
+    <div class="gate"><span class="g-n">6</span><span><b>在场持仓数门</b> —— 钱包在场持仓达上限（默认 10 笔）拒绝开新仓，平仓后自动腾额度。</span></div>
+
+    <h3>运行中的 4 道自动熔断</h3>
+    <ul>
+      <li><b>API 连续失败</b> 10 次 → 急停（怕数据断流下错单）。</li>
+      <li><b>当日亏损</b> 触及上限 → 急停。</li>
+      <li><b>连续亏损</b> 达 5 笔 → 急停（信号可能失效）。</li>
+      <li><b>余额跌破绝对底线</b> → 彻底停手。</li>
+    </ul>
+    <div class="callout ok">
+      下单方式用 <b>FOK 市价单</b>（要么立即全部成交、要么取消），不会留下"挂单未成交却记账"的幽灵持仓；
+      成交后写台账，市场结算时自动回填盈亏、驱动上面的熔断。
+    </div>
+  </section>
+
+  <section id="money">
+    <h2><span class="n">6</span>到底怎么才能赚钱</h2>
+    <p class="lead">赚钱不靠"预测得多"，靠"只在验证过的优势上，用复利下注"。顺序不能颠倒。</p>
+    <div class="step"><span class="num">1</span><span><b>空跑攒样本</b>：让系统持续记录信号，等市场陆续到期结算。优先扫"近到期"市场（可调）能加速这一步。</span></div>
+    <div class="step"><span class="num">2</span><span><b>跑 edge 验证</b>：攒够 ≥30 个已结算市场后，看历史信号的真实收益。95% 置信区间下界 &gt; 0 才算"edge 是真的"。</span></div>
+    <div class="step"><span class="num">3</span><span><b>微额灰度实盘</b>：验证通过后，把单笔压到 0.5~1 USDC 开真钱，每日对账"预期盈亏 vs 实际盈亏"。这一步戳穿模型偏差。</span></div>
+    <div class="step"><span class="num">4</span><span><b>Kelly 复利放大</b>：只有实盘对账证明"预期≈实际"了，才逐步放大仓位，让复利发挥作用。</span></div>
+    <div class="callout danger">
+      <b>最诚实的一句话：</b>快速积累的是"意见"（每 45 秒一堆信号），不是"被验证的意见"。
+      赚钱的前提是后者。任何"高频 = 快速稳赚"的直觉，在预测市场里几乎都通向亏损。
+      尊重"攒样本 → 验证 → 微额实盘 → 才放大"这个顺序，才是这套策略能稳定复利的真正前提。
+    </div>
+  </section>
+
+  <p class="muted" style="text-align:center;margin-top:30px;">
+    本文所有机制均依据项目源码整理。代码在演进，若与最新行为不符，以代码为准。
+  </p>
+
+</main>
+</body>
+</html>

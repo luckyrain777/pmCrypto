@@ -49,6 +49,7 @@ def compute_stake(
     kelly_min: float,
     kelly_max: float,
     max_single_pct: float,
+    max_single_usdc: float = 0.0,
 ) -> KellySizing:
     """计算一个机会的建议下注额。
 
@@ -84,6 +85,9 @@ def compute_stake(
     stake = balance_usdc * f_final
     # 再受剩余总仓位与流动性约束
     stake = min(stake, remaining_exposure_usdc, leg_liquidity_usdc)
+    # 单笔金额硬上限（USDC）：实测保险丝，>0 时无条件封顶。0=不限。
+    if max_single_usdc > 0:
+        stake = min(stake, max_single_usdc)
     stake = max(stake, 0.0)
 
     if stake <= 0.0:

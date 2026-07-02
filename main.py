@@ -17,6 +17,7 @@ import time
 
 from config import CONFIG
 from core.state import STATE
+from core.activity import ACTIVITY
 from data.client import MarketDataSource, PolymarketSource
 from data.store import Store
 from execution.base import Executor
@@ -32,10 +33,45 @@ def build_executors(store: Store, notifier: Notifier, guard) -> dict:
     这样控制台运行时切 manual↔auto 立即生效，且 auto 的客户端缓存得以保留。
     """
     from execution.auto import AutoExecutor
+    from execution.arb import ArbExecutor
+    from data.portfolio import PortfolioReader
+    # 只读组合查询器：auto 门6用它查链上在场持仓笔数（带缓存，失败降级）。
+    portfolio_reader = PortfolioReader()
     return {
         "manual": ManualExecutor(store, notifier),
-        "auto": AutoExecutor(store, notifier, guard),
+        "auto": AutoExecutor(store, notifier, guard,
+                             portfolio_reader=portfolio_reader),
+        "arb": ArbExecutor(store, notifier, guard),
     }
+
+
+def _settle_cycle(store: Store, notifier: Notifier, guard=None) -> None:
+    """每轮：①刷新已到期市场的结算结果(edge 验证的原料，【不依赖是否持仓】)
+    ②有持仓台账时回填盈亏。任何异常都隔离，绝不拖垮主循环。
+
+    修复：旧版"无 open 台账就整体跳过"会导致 resolutions 永远空、edge 验证
+    永远 0 结算的死锁。结算原料的积累必须独立于是否下单。
+    """
+    try:
+        # ① 结算原料：只查一小批"已到期未结算"市场，限量避免狂发 API。
+        try:
+            expired = store.expired_unresolved_market_ids(time.time(), limit=40)
+            if expired:
+                from data.resolutions import refresh_resolutions
+                from polymarket import PublicClient
+                n = refresh_resolutions(PublicClient(), store, market_ids=expired)
+                if n:
+                    notifier.info(f"新增 {n} 个市场结算结果（edge 验证原料 +{n}）。")
+                    ACTIVITY.record("settle", f"拉取到 {n} 个市场结算结果", time.time())
+        except Exception as exc:  # noqa: BLE001
+            notifier.warning(f"刷新结算结果失败（下轮重试）：{exc}")
+
+        # ② 持仓回填：有 open 台账才做（把已到期持仓转成已实现盈亏）。
+        if store.open_trades():
+            from execution.settlement import settle_open_trades
+            settle_open_trades(store, notifier=notifier, guard=guard)
+    except Exception as exc:  # noqa: BLE001
+        notifier.warning(f"结算回填异常（不影响主循环）：{exc}")
 
 
 def run_cycle(
@@ -46,7 +82,11 @@ def run_cycle(
     notifier: Notifier,
     crypto_source=None,
 ) -> None:
-    """跑一轮：抓→存→检测→风控→执行。"""
+    """跑一轮：结算回填→抓→存→检测→风控→执行。"""
+    # 先结算：把已到期持仓的已实现盈亏回填进 STATE（驱动连亏/当日止损熔断）。
+    # 这一步不受 paused/halted 影响——它记录的是已发生的事实，不是新交易。
+    _settle_cycle(store, notifier, guard)
+
     if CONFIG.paused:
         notifier.info("扫描已暂停（网页控制台可恢复）。")
         return
@@ -57,6 +97,8 @@ def run_cycle(
     # 按运行时模式选执行器（控制台切 manual↔auto 即时生效）。
     executor = (executors or {}).get(CONFIG.executor_mode) \
         or (executors or {}).get("manual")
+    # 套利执行器：独立于方向性，受 enable_arb_auto 开关控制（内部自检）。
+    arb_executor = (executors or {}).get("arb")
 
     try:
         markets = source.fetch_markets(limit=CONFIG.max_markets_per_cycle)
@@ -81,10 +123,16 @@ def run_cycle(
         # 阶段A：套利偏差（当前快照即可判断）
         for opp in detector.detect(market):
             store.save_opportunity(opp)
-            signal = guard.assess(opp)
-            if signal is not None:
-                executor.execute(signal)
+            if CONFIG.enable_arb_auto and arb_executor is not None:
+                # 套利自动：多腿逐腿下单+失败回滚（执行器内部自检开关/凭证/急停）。
+                arb_executor.execute(opp)
                 signal_count += 1
+            else:
+                # 仅提示：走风控评估 + 提示执行器（不自动下单）。
+                signal = guard.assess(opp)
+                if signal is not None:
+                    executor.execute(signal)
+                    signal_count += 1
 
         # 阶段B：方向性 edge（需历史序列）
         if CONFIG.enable_edge_strategy:
@@ -111,12 +159,16 @@ def run_cycle(
             executor.execute(signal)
             signal_count += 1
 
+    now = time.time()
     if signal_count == 0:
         notifier.info("本轮无可提示信号（机会稀少属正常）。")
+        ACTIVITY.record("scan", f"扫描 {len(markets)} 个市场，无可提示机会", now)
     else:
         notifier.info(f"本轮产生 {signal_count} 个建议信号。")
+        ACTIVITY.record("scan",
+                        f"扫描 {len(markets)} 个市场，产生 {signal_count} 个信号", now)
 
-    STATE.mark_cycle(len(markets), time.time())
+    STATE.mark_cycle(len(markets), now)
 
 
 def start_web(store: Store, notifier: Notifier, guard=None) -> None:
@@ -145,6 +197,10 @@ def main() -> int:
     parser.add_argument("--refresh-resolutions", action="store_true",
                         help="拉取并记录已关闭市场的结算结果（edge验证原料）")
     args = parser.parse_args()
+
+    # 恢复上次在面板改过的运行时参数（持仓上限/单笔金额上限/开关等），
+    # 否则重启后会回到代码默认值。密钥不在此文件，安全。
+    CONFIG.load_runtime()
 
     notifier = Notifier()
     store = Store(CONFIG.db_path)

@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     market_id   TEXT NOT NULL,
     question    TEXT,
+    slug        TEXT DEFAULT '',         -- Polymarket slug（拼跳转链接）
+    category    TEXT DEFAULT '',         -- 事件类型（Sports/Politics/Crypto…）
     snapshot_ts REAL NOT NULL,
     outcomes_json TEXT NOT NULL          -- 序列化的 OutcomeBook 列表
 );
@@ -62,6 +64,23 @@ CREATE TABLE IF NOT EXISTS resolutions (
     winning_token_id TEXT,               -- 最终获胜结果的 token_id
     resolved_ts     REAL NOT NULL
 );
+
+-- 真实持仓台账：auto 真钱下单成功后留痕，市场结算后回填盈亏。
+-- 这是“已实现盈亏→连亏/当日止损熔断”的数据地基（没有它熔断拿不到数据）。
+CREATE TABLE IF NOT EXISTS trades (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id   TEXT NOT NULL,
+    token_id    TEXT NOT NULL,           -- 实际买入的结果 token
+    cost_price  REAL NOT NULL,           -- 成交买入价（0~1）
+    shares      REAL NOT NULL,           -- 成交份数
+    cost_usdc   REAL NOT NULL,           -- 成本名义额（≈ cost_price*shares）
+    status      TEXT NOT NULL DEFAULT 'open',   -- open / closed
+    realized_pnl_usdc REAL,              -- 平仓后回填的已实现盈亏
+    group_id    TEXT,                    -- 套利组标识：同组多腿聚合后再喂熔断
+    created_ts  REAL NOT NULL,
+    resolved_ts REAL                     -- 平仓/结算时间
+);
+CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 """
 
 
@@ -88,6 +107,13 @@ class Store:
             if "end_ts" not in cols:
                 conn.execute(
                     "ALTER TABLE market_snapshots ADD COLUMN end_ts REAL DEFAULT 0")
+            # 幂等升级：补 slug/category 列（跳转链接 + 事件类型列）。
+            if "slug" not in cols:
+                conn.execute(
+                    "ALTER TABLE market_snapshots ADD COLUMN slug TEXT DEFAULT ''")
+            if "category" not in cols:
+                conn.execute(
+                    "ALTER TABLE market_snapshots ADD COLUMN category TEXT DEFAULT ''")
             # 幂等升级：给旧库的 signals/opportunities 补 question 列（问题文本快照）。
             for tbl in ("signals", "opportunities"):
                 tcols = {r[1] for r in conn.execute(
@@ -95,6 +121,11 @@ class Store:
                 if "question" not in tcols:
                     conn.execute(
                         f"ALTER TABLE {tbl} ADD COLUMN question TEXT DEFAULT ''")
+            # 幂等升级：给旧库 trades 补 group_id（套利组聚合结算用）。
+            tcols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(trades)").fetchall()}
+            if tcols and "group_id" not in tcols:
+                conn.execute("ALTER TABLE trades ADD COLUMN group_id TEXT")
 
     # ── 写入 ──────────────────────────────────────────────
     def save_market_snapshot(self, market: Market) -> None:
@@ -112,10 +143,10 @@ class Store:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO market_snapshots "
-                "(market_id, question, snapshot_ts, outcomes_json, end_ts) "
-                "VALUES (?,?,?,?,?)",
-                (market.market_id, market.question, market.snapshot_ts,
-                 json.dumps(outcomes), market.end_ts),
+                "(market_id, question, slug, category, snapshot_ts, outcomes_json, end_ts) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (market.market_id, market.question, market.slug, market.category,
+                 market.snapshot_ts, json.dumps(outcomes), market.end_ts),
             )
 
     def save_opportunity(self, opp: Opportunity) -> None:
@@ -198,6 +229,8 @@ class Store:
                 outcomes=outcomes,
                 snapshot_ts=r["snapshot_ts"],
                 end_ts=(r["end_ts"] if "end_ts" in r.keys() else 0.0) or 0.0,
+                slug=(r["slug"] if "slug" in r.keys() else "") or "",
+                category=(r["category"] if "category" in r.keys() else "") or "",
             )
 
     def market_history(self, market_id: str, limit: int = 50) -> list[Market]:
@@ -227,6 +260,8 @@ class Store:
                 outcomes=outcomes,
                 snapshot_ts=r["snapshot_ts"],
                 end_ts=(r["end_ts"] if "end_ts" in r.keys() else 0.0) or 0.0,
+                slug=(r["slug"] if "slug" in r.keys() else "") or "",
+                category=(r["category"] if "category" in r.keys() else "") or "",
             ))
         return out
 
@@ -234,6 +269,32 @@ class Store:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT market_id FROM market_snapshots"
+            ).fetchall()
+        return [r["market_id"] for r in rows]
+
+    def expired_unresolved_market_ids(self, now: float,
+                                      limit: int = 50) -> list[str]:
+        """已到期(end_ts<now)但尚未结算的市场 id，最多 limit 个。
+
+        edge 验证的原料来源：这些市场该去拉结算结果了，与是否持仓无关。
+        限量避免每轮对成百上千个市场狂发 API。end_ts<=0(未知到期)不算。
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT market_id, MAX(end_ts) AS e,
+                       (market_id IN (
+                           SELECT market_id FROM signals
+                           WHERE kind = 'edge_directional'
+                       )) AS signaled
+                FROM market_snapshots
+                GROUP BY market_id
+                HAVING e > 0 AND e < ?
+                   AND market_id NOT IN (SELECT market_id FROM resolutions)
+                ORDER BY signaled DESC, e ASC
+                LIMIT ?
+                """,
+                (now, limit),
             ).fetchall()
         return [r["market_id"] for r in rows]
 
@@ -258,3 +319,45 @@ class Store:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT * FROM resolutions").fetchall()
         return {r["market_id"]: r["winning_token_id"] for r in rows}
+
+    # ── 真实持仓台账：下单留痕 + 结算平仓回填 ─────────────────
+    def record_trade(self, market_id: str, token_id: str, cost_price: float,
+                     shares: float, cost_usdc: float, created_ts: float,
+                     group_id: str | None = None) -> int:
+        """真钱下单成功后记一笔 open 台账，返回 trade id。
+
+        group_id：同一笔多腿套利的各腿传同一个值，供结算时按组聚合盈亏
+        （避免盈利套利的输腿被逐腿误记连亏）。单腿方向性单不传（None）。
+        """
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO trades "
+                "(market_id, token_id, cost_price, shares, cost_usdc, "
+                " status, group_id, created_ts) VALUES (?,?,?,?,?, 'open', ?, ?)",
+                (market_id, token_id, cost_price, shares, cost_usdc,
+                 group_id, created_ts),
+            )
+            return int(cur.lastrowid)
+
+    def open_trades(self) -> list[dict]:
+        """所有未平仓（open）台账。"""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE status='open' ORDER BY id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_trades(self) -> list[dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT * FROM trades ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+    def close_trade(self, trade_id: int, realized_pnl_usdc: float,
+                    resolved_ts: float) -> None:
+        """结算后平仓：回填已实现盈亏并标记 closed。"""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET status='closed', realized_pnl_usdc=?, "
+                "resolved_ts=? WHERE id=?",
+                (realized_pnl_usdc, resolved_ts, trade_id),
+            )

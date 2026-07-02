@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Protocol
 
 from config import CONFIG
@@ -76,8 +77,11 @@ class PolymarketSource:
         ts = time.time()
 
         # 1) 列市场（Gamma 层，二元 yes/no 结构）。
-        # list_markets 返回 Paginator；iter_items() 跨页逐个吐出 Market。
-        paginator = self._call_with_retry(client.list_markets)
+        # 优先近到期：只取从现在起 N 天内到期、未关闭的市场，按到期升序，
+        # 让迭代器优先吐出快结算的市场——加速已结算样本积累、edge 验证达标。
+        # 窗口为 0 时回到旧行为（不加过滤，扫描全部）。
+        kwargs = self._short_expiry_kwargs()
+        paginator = self._call_with_retry(client.list_markets, **kwargs)
         markets_iter = self._take(paginator.iter_items(), limit)
 
         # 2) 逐个市场取盘口，转成标准 Market。
@@ -101,9 +105,46 @@ class PolymarketSource:
                     outcomes=tuple(outcomes),
                     snapshot_ts=ts,
                     end_ts=self._end_ts(m),
+                    slug=str(getattr(m, "slug", None) or ""),
+                    category=self._category(m),
                 )
             )
         return results
+
+    @staticmethod
+    def _short_expiry_kwargs() -> dict:
+        """构造 list_markets 的“近到期优先”过滤参数。
+
+        窗口 = CONFIG.prefer_short_expiry_days（天）。>0 时：
+          - closed=False：只看未关闭市场；
+          - end_date_min=现在 / end_date_max=现在+窗口：只看近期到期；
+          - order='endDate', ascending=True：按到期升序，快结算的排前面。
+        窗口=0 返回空 dict（不加过滤，扫描全部）。
+        """
+        days = getattr(CONFIG, "prefer_short_expiry_days", 0)
+        if not days or days <= 0:
+            return {}
+        now = datetime.now(timezone.utc)
+        return {
+            "closed": False,
+            "end_date_min": now,
+            "end_date_max": now + timedelta(days=days),
+            "order": "endDate",
+            "ascending": True,
+        }
+
+    @staticmethod
+    def _category(m) -> str:
+        """事件类型：优先市场自带 category，空则取第一个 tag 的 label，再空返回''。"""
+        cat = getattr(m, "category", None)
+        if cat:
+            return str(cat)
+        tags = getattr(m, "tags", None) or ()
+        for t in tags:
+            label = getattr(t, "label", None)
+            if label:
+                return str(label)
+        return ""
 
     @staticmethod
     def _end_ts(m) -> float:

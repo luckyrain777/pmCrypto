@@ -5,8 +5,9 @@
 /api/control  POST 运维动作：halt/resume（急停/解除）、pause/unpause（暂停/恢复扫描）
 /api/edge-report POST 跑一次 edge 验证报告并返回文本结论
 
-安全说明：默认仅监听 127.0.0.1（本机）。executor_mode 可经 /api/config 直接切到
-auto——但 auto 执行器在真实下单逻辑实现前会拒绝执行，故当前切换不会真的花钱。
+安全说明：默认仅监听 127.0.0.1（本机）。真实下单逻辑【已实现】——auto 执行器
+在满足门槛（非 dry_run + edge 验证/凭证）后会用真钱下单；套利经 enable_arb_auto
+开启后同样会真实下单。默认 dry_run=True 是保护，但一旦经真钱总闸解锁即会花钱。
 """
 from __future__ import annotations
 
@@ -17,9 +18,40 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from config import CONFIG
 from core.state import STATE
+from core.activity import ACTIVITY
 from data.store import Store
 
 _STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+# edge 报告较重（遍历所有已结算市场回放），缓存 60 秒——进度变化很慢，无需每次刷新都算。
+_EDGE_CACHE: dict = {"data": None, "ts": 0.0}
+_EDGE_CACHE_TTL = 60.0
+
+
+def _cached_edge_report(store: Store) -> dict:
+    """带缓存地跑 edge 验证报告，返回面板要的进度指标。失败返回空 dict。"""
+    import time
+    now = time.time()
+    if _EDGE_CACHE["data"] is not None and (now - _EDGE_CACHE["ts"]) < _EDGE_CACHE_TTL:
+        return _EDGE_CACHE["data"]
+    try:
+        from backtest.edge_report import run_edge_report
+        rep = run_edge_report(store)
+        lo, hi = rep.ci95
+        data = {
+            "bets": rep.bets,
+            "bets_needed": 30,
+            "win_rate": round(rep.win_rate, 3),
+            "mean_return": round(rep.mean_return, 4),
+            "ci_low": (None if lo == float("-inf") else round(lo, 4)),
+            "ci_high": (None if hi == float("inf") else round(hi, 4)),
+            "passed": rep.edge_significantly_positive,
+        }
+    except Exception:
+        data = {}
+    _EDGE_CACHE["data"] = data
+    _EDGE_CACHE["ts"] = now
+    return data
 
 
 def _build_dashboard(store: Store, guard, portfolio_reader=None) -> dict:
@@ -55,6 +87,16 @@ def _build_dashboard(store: Store, guard, portfolio_reader=None) -> dict:
     sigs = store.recent_signals(limit=500)
     today_sigs = [s for s in sigs if (s.get("created_ts") or 0) >= day_start]
 
+    # 真实下单流水：今日已花金额 + 上次下单时间（数据现成，之前没接上）。
+    try:
+        trades = store.all_trades()
+    except Exception:
+        trades = []
+    today_spend = round(sum(t.get("cost_usdc", 0) or 0
+                            for t in trades
+                            if (t.get("created_ts") or 0) >= day_start), 2)
+    last_trade_ts = max((t.get("created_ts") or 0 for t in trades), default=0.0)
+
     # edge 进度：市场总数 / 已结算数
     try:
         markets_total = len(store.distinct_market_ids())
@@ -80,8 +122,12 @@ def _build_dashboard(store: Store, guard, portfolio_reader=None) -> dict:
         "positions_value_usdc": real_posval,
         "positions": real_positions,
         "positions_count": len(real_positions),
+        "max_open_positions": cfg.max_open_positions,   # 真钱开新仓的在场笔数上限
         "signals_today": len(today_sigs),        # 建议信号数（非真实成交）
         "real_trades": st.get("real_trades", 0),  # 真实成交笔数
+        "today_spend_usdc": today_spend,          # 今日真钱已花金额
+        "last_trade_ts": last_trade_ts,           # 上次真实下单时间（0=从未）
+        "last_markets_scanned": st.get("last_markets_scanned", 0),  # 上轮扫描市场数
         "poll_interval_sec": cfg.poll_interval_sec,
         "last_cycle_ts": st.get("last_cycle_ts", 0.0),
         "markets_per_cycle": cfg.max_markets_per_cycle,
@@ -97,6 +143,7 @@ def _build_dashboard(store: Store, guard, portfolio_reader=None) -> dict:
         "edge_progress": {
             "markets_total": markets_total,
             "resolved_total": resolved_total,
+            "report": _cached_edge_report(store),
             "hint": ("已有结算数据，可点『运行 edge 报告』查看是否达标"
                      if resolved_total > 0
                      else "尚无市场结算，需等待市场收盘后再验证 edge"),
@@ -116,6 +163,12 @@ def create_app(store: Store, guard=None) -> FastAPI:
         with open(os.path.join(_STATIC_DIR, "index.html"), encoding="utf-8") as f:
             return f.read()
 
+    @app.get("/about", response_class=HTMLResponse)
+    def about() -> str:
+        """项目全景说明：预测什么、原理、科学性与局限、安全机制。"""
+        with open(os.path.join(_STATIC_DIR, "about.html"), encoding="utf-8") as f:
+            return f.read()
+
     @app.get("/api/state")
     def api_state() -> JSONResponse:
         return JSONResponse({
@@ -125,6 +178,7 @@ def create_app(store: Store, guard=None) -> FastAPI:
             "markets": store.latest_market_snapshots(limit=100),
             "opportunities": store.recent_opportunities(limit=50),
             "signals": store.recent_signals(limit=50),
+            "activities": ACTIVITY.recent(limit=40),   # 实时活动流（系统刚才做了什么）
         })
 
     @app.post("/api/config")
@@ -133,8 +187,8 @@ def create_app(store: Store, guard=None) -> FastAPI:
         applied = CONFIG.apply(body if isinstance(body, dict) else {})
         note = ""
         if applied.get("executor_mode") == "auto":
-            note = ("已切到 auto 模式。注意：真实下单逻辑尚未实现，"
-                    "auto 执行器目前会拒绝执行，不会真的下单。")
+            note = ("已切到 auto 模式。⚠️ 真实下单逻辑已实现：若 dry_run=False 且"
+                    "通过 edge 验证+凭证，方向性信号会用真钱下单。请经真钱总闸操作。")
         return JSONResponse({"applied": applied,
                              "config": CONFIG.mutable_dict(), "note": note})
 
@@ -209,10 +263,29 @@ def create_app(store: Store, guard=None) -> FastAPI:
                              "message": "已启用真钱自动交易。系统将在下一轮自动下单。",
                              "config": CONFIG.mutable_dict()})
 
+    @app.post("/api/go-live-arb")
+    def api_go_live_arb() -> JSONResponse:
+        """套利真钱总闸：套利无风险、无需 edge 验证，只查凭证齐全即可启用。
+
+        与方向性的 /api/go-live 分开——套利是纯算术锁利，不依赖任何预测。
+        """
+        from data.credentials import load_credentials
+        if load_credentials() is None:
+            return JSONResponse({"ok": False, "blockers": [
+                ".env 凭证不全（需 POLYGON_PRIVATE_KEY + CLOB_API_KEY/SECRET/PASSPHRASE）。"
+            ], "config": CONFIG.mutable_dict()}, status_code=200)
+        # 只开套利自动 + 关干跑；不动方向性的 executor_mode/edge_verified。
+        CONFIG.apply({"enable_arb_auto": True, "dry_run": False})
+        STATE.reset()
+        return JSONResponse({"ok": True,
+                             "message": "已启用套利自动交易（无风险锁利，多腿逐腿+失败回滚）。",
+                             "config": CONFIG.mutable_dict()})
+
     @app.post("/api/go-safe")
     def api_go_safe() -> JSONResponse:
-        """一键退回安全态：manual + 干跑保护，立即停止一切真实下单。"""
-        CONFIG.apply({"executor_mode": "manual", "dry_run": True})
+        """一键退回安全态：manual + 干跑 + 关套利自动，立即停止一切真实下单。"""
+        CONFIG.apply({"executor_mode": "manual", "dry_run": True,
+                      "enable_arb_auto": False})
         return JSONResponse({"ok": True, "message": "已回到安全态（只提示、不下单）。",
                              "config": CONFIG.mutable_dict()})
 

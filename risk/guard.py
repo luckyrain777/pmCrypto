@@ -93,6 +93,7 @@ class RiskGuard:
             kelly_min=CONFIG.kelly_fraction_min,
             kelly_max=CONFIG.kelly_fraction_max,
             max_single_pct=CONFIG.kelly_max_single_pct,
+            max_single_usdc=CONFIG.max_single_order_usdc,
         )
         if sizing.stake_usdc <= 0:
             return None

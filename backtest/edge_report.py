@@ -96,18 +96,29 @@ def run_edge_report(store: Store, *, min_history: int = 3) -> EdgeReport:
         if len(history) < min_history:
             continue
 
-        # 在多个历史时点评估（用递增前缀模拟“当时能看到的数据”）。
+        # 统计独立性修复：每个市场只贡献【1】个独立下注样本。
+        # 递增前缀会让同一市场在多个时点反复检出同一信号——这些样本高度
+        # 自相关（伪重复/pseudoreplication），若都计入，用独立同分布假设算的
+        # 95% 置信区间会被严重低估，让假 edge 通过验证。
+        # 取【第一个触发信号的时点】：最早发现错价的决策点，最贴近实盘会怎么下，
+        # 且不同市场之间相互独立。
+        first_opp = None
         for end in range(min_history, len(history) + 1):
-            prefix = history[:end]
-            for opp in detect_edge(prefix):
-                # 该机会买入的 token 与结算获胜 token 比较。
-                bought_token = opp.legs[0][0]
-                buy_price = opp.legs[0][1]
-                won = (bought_token == winner)
-                # 单位注收益率：赢 (1 - buy_price)，输 -buy_price。
-                ret = (1.0 - buy_price) if won else (-buy_price)
-                report.bets += 1
-                report.wins += 1 if won else 0
-                report.per_bet_returns.append(ret)
+            opps = detect_edge(history[:end])
+            if opps:
+                first_opp = opps[0]
+                break
+
+        if first_opp is None:
+            continue  # 该市场从未触发信号，不贡献样本
+
+        bought_token = first_opp.legs[0][0]
+        buy_price = first_opp.legs[0][1]
+        won = (bought_token == winner)
+        # 单位注收益率：赢 (1 - buy_price)，输 -buy_price。
+        ret = (1.0 - buy_price) if won else (-buy_price)
+        report.bets += 1
+        report.wins += 1 if won else 0
+        report.per_bet_returns.append(ret)
 
     return report

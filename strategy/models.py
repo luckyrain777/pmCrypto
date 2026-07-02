@@ -40,6 +40,8 @@ class Market:
     outcomes: tuple[OutcomeBook, ...]   # 所有互斥结果
     snapshot_ts: float = 0.0            # 快照时间戳（epoch 秒），回测靠它排序
     end_ts: float = 0.0                 # 市场到期时间（epoch 秒），0=未知；加密定价需要
+    slug: str = ""          # Polymarket 市场 slug，用于拼跳转链接 /event/<slug>
+    category: str = ""      # 事件类型（Sports/Politics/Crypto…），面板“类型”列
 
     @property
     def is_binary(self) -> bool:

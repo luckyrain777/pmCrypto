@@ -27,3 +27,12 @@ env/
 .vscode/
 .idea/
 .claude/settings.local.json
+
+# 本地 worktree / 会话临时目录
+.claude/worktrees/
+
+# 运行时可变配置（面板改的参数，属本地状态，不进版本库）
+data/config.runtime.json
+
+# 临时/演示文件
+docs/button-mockup.html

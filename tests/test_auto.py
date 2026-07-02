@@ -21,8 +21,9 @@ class FakeNotifier:
 
 
 class FakeStore:
-    def __init__(self): self.saved = []
+    def __init__(self): self.saved = []; self.trades = []
     def save_signal(self, sig, created_ts): self.saved.append(sig)
+    def record_trade(self, **kw): self.trades.append(kw); return len(self.trades)
 
 
 class FakeGuard:
@@ -31,11 +32,19 @@ class FakeGuard:
 
 
 class Accepted:
-    ok = True; order_id = "ORD1"
+    """FOK 成交：trade_ids 非空即视为真成交。"""
+    ok = True; order_id = "ORD1"; trade_ids = ["T1"]
+    making_amount = 10.0; taking_amount = 20.0; status = "matched"
+
+
+class NotFilled:
+    """FOK 被 kill：ok=True 但无成交（trade_ids 空）→ 不应记账。"""
+    ok = True; order_id = "ORD2"; trade_ids = []
+    making_amount = 0.0; taking_amount = 0.0; status = "unmatched"
 
 
 class Rejected:
-    ok = False; code = "X"; message = "insufficient"
+    ok = False; code = "X"; message = "insufficient"; trade_ids = []
 
 
 class FakeClient:
@@ -43,7 +52,7 @@ class FakeClient:
     def get_balance_allowance(self, *, asset_type):
         class B: balance = 100.0
         return B()
-    def place_limit_order(self, **kw): self.orders.append(kw); return self.resp
+    def place_market_order(self, **kw): self.orders.append(kw); return self.resp
 
 
 def _edge_signal(size=10.0, price=0.5):
@@ -119,10 +128,32 @@ def test_live_places_order_and_reserves(monkeypatch):
     ex.execute(_edge_signal(size=10.0, price=0.5))
     assert len(ex._client.orders) == 1
     o = ex._client.orders[0]
+    # FOK 市价单：按金额(amount)买入，非挂历史价的限价单
     assert o["side"] == "BUY" and o["token_id"] == "token123456"
-    assert abs(o["size"] - 20.0) < 1e-6      # 10 USDC / 0.5 = 20 份
+    assert o["order_type"] == "FOK"
+    assert abs(o["amount"] - 10.0) < 1e-6     # 花 10 USDC
+    assert o["max_price"] > 0.5               # 防滑点上限 > 信号价
     assert g.reserved == 10.0                # 占用仓位
     assert len(s.saved) == 1
+    # 成交(trade_ids 非空)才写入持仓台账
+    assert len(s.trades) == 1
+    t = s.trades[0]
+    assert t["token_id"] == "token123456"
+    assert abs(t["shares"] - 20.0) < 1e-6     # 10 USDC / 0.5 = 20 份
+    assert abs(t["cost_usdc"] - 10.0) < 1e-6
+
+
+def test_fok_not_filled_no_record(monkeypatch):
+    """FOK 被 kill（ok=True 但 trade_ids 空）→ 不记账、不占额度、不计成交。"""
+    _mk(monkeypatch, dry_run=False, edge_verified=True)
+    n, s, g = FakeNotifier(), FakeStore(), FakeGuard()
+    ex = auto_module.AutoExecutor(s, n, g)
+    ex._client = FakeClient(NotFilled())
+    monkeypatch.setattr(ex, "_ensure_client", lambda: True)
+    ex.execute(_edge_signal(size=10.0, price=0.5))
+    assert s.trades == []              # 无幽灵台账
+    assert g.reserved == 0.0           # 无幽灵占用
+    assert any("未成交" in m for m in n.warns)
 
 
 def test_live_rejected_order_no_reserve(monkeypatch):
@@ -134,6 +165,67 @@ def test_live_rejected_order_no_reserve(monkeypatch):
     ex.execute(_edge_signal())
     assert any("下单被拒" in m for m in n.warns)
     assert g.reserved == 0.0                 # 未占用
+    assert getattr(ex._store, "trades", []) == []  # 下单失败不写台账
+
+
+# ── 门6：最大在场持仓数（链上持仓笔数封顶）──────────────────
+class FakeReader:
+    """假 PortfolioReader：可控返回的持仓笔数或 None（查询失败）。"""
+    def __init__(self, n_positions):
+        self._n = n_positions
+    def snapshot(self, *a, **k):
+        if self._n is None:
+            return None
+        class Snap:
+            positions = [{"i": i} for i in range(self._n)]
+        return Snap()
+
+
+def test_max_positions_blocks_when_at_limit(monkeypatch):
+    """链上已有 10 笔在场、上限 10 → 拒绝再开新仓，不下单。"""
+    _mk(monkeypatch, dry_run=False, edge_verified=True, max_open_positions=10)
+    n, g = FakeNotifier(), FakeGuard()
+    ex = auto_module.AutoExecutor(FakeStore(), n, g, portfolio_reader=FakeReader(10))
+    ex._client = FakeClient(Accepted())
+    monkeypatch.setattr(ex, "_ensure_client", lambda: True)
+    ex.execute(_edge_signal())
+    assert ex._client.orders == []                     # 未下单
+    assert any("在场持仓" in m for m in n.warns)
+    assert g.reserved == 0.0
+
+
+def test_max_positions_allows_below_limit(monkeypatch):
+    """链上 9 笔、上限 10 → 放行，正常下单。"""
+    _mk(monkeypatch, dry_run=False, edge_verified=True, max_open_positions=10)
+    n, g = FakeNotifier(), FakeGuard()
+    ex = auto_module.AutoExecutor(FakeStore(), n, g, portfolio_reader=FakeReader(9))
+    ex._client = FakeClient(Accepted())
+    monkeypatch.setattr(ex, "_ensure_client", lambda: True)
+    ex.execute(_edge_signal())
+    assert len(ex._client.orders) == 1                 # 已下单
+
+
+def test_max_positions_query_fail_allows(monkeypatch):
+    """持仓查询失败(None) → 保守放行（笔数上限非安全熔断），但告警。"""
+    _mk(monkeypatch, dry_run=False, edge_verified=True, max_open_positions=10)
+    n, g = FakeNotifier(), FakeGuard()
+    ex = auto_module.AutoExecutor(FakeStore(), n, g, portfolio_reader=FakeReader(None))
+    ex._client = FakeClient(Accepted())
+    monkeypatch.setattr(ex, "_ensure_client", lambda: True)
+    ex.execute(_edge_signal())
+    assert len(ex._client.orders) == 1                 # 放行下单
+    assert any("持仓数未知" in m for m in n.warns)     # 有告警
+
+
+def test_max_positions_no_reader_skips_gate(monkeypatch):
+    """未注入 reader（如旧调用）→ 不启用该门，正常下单。"""
+    _mk(monkeypatch, dry_run=False, edge_verified=True, max_open_positions=10)
+    n, g = FakeNotifier(), FakeGuard()
+    ex = auto_module.AutoExecutor(FakeStore(), n, g)   # 无 portfolio_reader
+    ex._client = FakeClient(Accepted())
+    monkeypatch.setattr(ex, "_ensure_client", lambda: True)
+    ex.execute(_edge_signal())
+    assert len(ex._client.orders) == 1
 
 
 # ── credentials ───────────────────────────────────────────

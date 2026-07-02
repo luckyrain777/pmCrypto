@@ -15,21 +15,25 @@
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Optional
 
 from config import CONFIG
 from core.state import STATE
+from core.activity import ACTIVITY
 from data.store import Store
 from notify.console import Notifier
 from strategy.models import Signal, OpportunityKind
 
 
 class AutoExecutor:
-    def __init__(self, store: Store, notifier: Notifier, guard=None):
+    def __init__(self, store: Store, notifier: Notifier, guard=None,
+                 portfolio_reader=None):
         self._store = store
         self._notifier = notifier
         self._guard = guard
+        self._portfolio_reader = portfolio_reader  # 门6用：查链上在场持仓笔数
         self._client = None          # 懒建的 SecureClient
         self._creds = None           # 懒加载的凭证
 
@@ -101,6 +105,22 @@ class AutoExecutor:
             self._store.save_signal(signal, created_ts=time.time())
             return
 
+        # 门6：最大在场持仓数（链上真实持仓笔数封顶，含手动开的仓）。
+        # 平仓后链上持仓减少，额度自动腾出。查询失败时保守放行（这是笔数
+        # 上限而非安全熔断），但告警。未注入 reader 时跳过此门（向后兼容）。
+        if self._portfolio_reader is not None:
+            snap = self._portfolio_reader.snapshot()
+            if snap is None:
+                self._notifier.warning(
+                    "在场持仓数未知（链上查询失败），本单跳过持仓上限检查放行。")
+            else:
+                open_n = len(snap.positions)
+                if open_n >= CONFIG.max_open_positions:
+                    self._notifier.warning(
+                        f"拒绝开新仓：当前在场持仓 {open_n} 笔已达上限 "
+                        f"{CONFIG.max_open_positions}。平掉部分仓位或调高上限后再试。")
+                    return
+
         # 门3：edge 验证
         if not CONFIG.edge_verified:
             self._notifier.warning(
@@ -121,23 +141,51 @@ class AutoExecutor:
                 self._notifier.warning("余额不足以下这一单，跳过。")
                 return
 
-        # 真实下单（限价单，价格=信号买入价，防滑点）
+        # 真实下单：FOK 市价单——要么以当前盘口立即全部成交，要么直接取消。
+        # 这根除了“挂单未成交却记账”的幽灵持仓，也不会挂在信号产生时的旧价上。
+        # max_price 为防极端滑点的上限：吃不到信号价附近就宁可不成交。
+        # 必须对齐 tick size——Polymarket 拒绝 >2 位小数的价格(tick 0.01/0.001)。
+        # 向上取整到 2 位小数：对 0.01 和 0.001 两种 tick 都合规，且只放宽上限不收紧。
+        max_price = min(math.ceil(price * (1.0 + CONFIG.market_max_slippage_pct) * 100) / 100, 0.99)
         try:
-            resp = self._client.place_limit_order(
-                token_id=token_id, price=price, size=size_shares, side="BUY")
+            resp = self._client.place_market_order(
+                token_id=token_id, side="BUY", amount=size_usdc,
+                order_type="FOK", max_price=max_price)
         except Exception as exc:  # noqa: BLE001
             self._notifier.warning(f"下单异常：{exc}")
+            ACTIVITY.record("risk", f"方向性下单异常，未成交：{exc}", time.time())
             return
 
-        if getattr(resp, "ok", False):
-            self._notifier.info(
-                f"【已下单】order_id={getattr(resp,'order_id','?')} | "
-                f"BUY {token_id[:10]}… 价 {price:.3f} × {size_shares} 份")
-            self._store.save_signal(signal, created_ts=time.time())
-            STATE.record_real_trade()
-            if self._guard is not None:
-                self._guard.reserve(size_usdc)
-        else:
+        # 下单被拒（凭证/参数问题）。
+        if not getattr(resp, "ok", False):
             self._notifier.warning(
                 f"下单被拒：code={getattr(resp,'code','?')} "
                 f"msg={getattr(resp,'message','?')}")
+            ACTIVITY.record("risk",
+                            f"方向性下单被拒：{getattr(resp,'message','?')}", time.time())
+            return
+
+        # 关键成交判据：trade_ids 非空 = 真的有成交记录。
+        # FOK 被 kill 时 ok 可能仍为 True 但无成交——绝不记账、绝不占额度。
+        trade_ids = getattr(resp, "trade_ids", None) or []
+        if not trade_ids:
+            self._notifier.warning(
+                f"FOK 未成交（盘口无法在 max_price {max_price:.3f} 内全部成交），"
+                "已取消，不记账。")
+            return
+
+        # 已成交：FOK 保证全额成交，用下单量作为成交量（安全近似）。
+        self._notifier.info(
+            f"【已成交】order_id={getattr(resp,'order_id','?')} | "
+            f"BUY {token_id[:10]}… ≈{size_shares} 份 (≈{size_usdc:.2f} USDC) | "
+            f"trades={len(trade_ids)}")
+        now = time.time()
+        self._store.save_signal(signal, created_ts=now)
+        STATE.record_real_trade()
+        # 写入持仓台账：市场结算后据此回填已实现盈亏、驱动熔断。
+        self._store.record_trade(
+            market_id=signal.market_id, token_id=token_id,
+            cost_price=price, shares=size_shares, cost_usdc=size_usdc,
+            created_ts=now)
+        if self._guard is not None:
+            self._guard.reserve(size_usdc)

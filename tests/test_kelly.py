@@ -8,9 +8,22 @@ def _stake(**kw):
         balance_usdc=100.0, remaining_exposure_usdc=1000.0,
         leg_liquidity_usdc=1000.0, min_edge=0.05,
         kelly_min=0.25, kelly_max=0.50, max_single_pct=0.20,
+        max_single_usdc=0.0,   # 0 = 不限
     )
     base.update(kw)
     return compute_stake(**base)
+
+
+def test_absolute_usdc_cap_enforced():
+    # Kelly 本应下 10 USDC，但单笔硬上限 3 → 被削到 3（实测保险丝）
+    s = _stake(p=0.60, q=0.50, confidence=1.0, max_single_usdc=3.0)
+    assert abs(s.stake_usdc - 3.0) < 1e-6
+
+
+def test_zero_cap_means_unlimited():
+    # 上限 0 = 不限，仍按 Kelly 下 10
+    s = _stake(p=0.60, q=0.50, confidence=1.0, max_single_usdc=0.0)
+    assert abs(s.stake_usdc - 10.0) < 1e-6
 
 
 def test_adaptive_fraction_scales_with_confidence():
